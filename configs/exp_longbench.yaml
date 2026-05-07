@@ -1,0 +1,40 @@
+# LongBench (16 English subtasks)
+#
+# Usage:
+#   python eval_longbench.py --config configs/exp_longbench.yaml
+#   python eval_longbench.py --config configs/exp_longbench.yaml --tasks qasper,hotpotqa --fraction 0.1
+
+model: meta-llama/Meta-Llama-3.1-8B-Instruct
+
+tasks:
+  - qasper
+  - hotpotqa
+  - multifieldqa_en
+  - 2wikimqa
+  - musique
+  - gov_report
+  - qmsum
+  - multi_news
+  - trec
+  - samsum
+  - triviaqa
+  - passage_count
+  - passage_retrieval_en
+  - lcc
+  - repobench-p
+
+fraction: 1.0
+seed: 42
+output: results/exp_longbench.json
+
+experiments:
+  - label: baseline
+    mode: baseline
+
+  - label: odmkv_2bit
+    mode: backend_per_token
+    bits: [0, 2, 3, 4, 8, 16]
+    target_avg_bits: 2.0
+    eviction_cost: 0.5
+    n_outlier_channels: 0
+    outlier_min_bits: 2

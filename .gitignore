@@ -1,0 +1,15 @@
+# Build / cache
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Outputs
+results/
+*.log
+
+# Local overrides
+override.yaml
+override2.yaml
+.envrc
+.venv/

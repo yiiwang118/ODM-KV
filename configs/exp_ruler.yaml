@@ -1,0 +1,33 @@
+# RULER (13 synthetic long-context tasks)
+#
+# Usage:
+#   python eval_ruler.py --config configs/exp_ruler.yaml
+#   python eval_ruler.py --config configs/exp_ruler.yaml --context_length 8192
+#   python eval_ruler.py --config configs/exp_ruler.yaml --tasks niah_multikey_3,qa_2
+
+model: meta-llama/Meta-Llama-3.1-8B-Instruct
+
+context_length: 4096
+fraction: 1.0
+seed: 42
+output: results/exp_ruler.json
+
+# ODM-KV core scorer:
+#   s_j = p_j² · [‖v_j‖² + (‖k_j‖²/d) · ‖v_j − ō‖²]
+# Bit budget shared across (layer, head, token) via per-layer Lagrangian.
+# All hyperparameters except the bit budget + bit-set are hard-coded inside
+# benchmark.core.press_factory (sink_tokens, epsilon, normalize_grain,
+# layerwise, key_quantizer, value_quantizer, buffer_size, decode_quant,
+# allow_decode_eviction). See README "Hard-coded settings".
+
+experiments:
+  - label: baseline
+    mode: baseline
+
+  - label: odmkv_2bit
+    mode: backend_per_token
+    bits: [0, 2, 3, 4, 8, 16]
+    target_avg_bits: 2.0
+    eviction_cost: 0.5
+    n_outlier_channels: 0
+    outlier_min_bits: 2
