@@ -1,6 +1,5 @@
 include README.md requirements.txt eval_longbench.py eval_ruler.py
-recursive-include assets *.svg
+recursive-include assets *.png *.pdf
 recursive-include configs *.yaml
-recursive-include docs *.md
 recursive-include examples *.py
 recursive-include tests *.py

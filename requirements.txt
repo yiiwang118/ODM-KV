@@ -1,2 +1,9 @@
 # Core package and optional benchmark dependencies.
 -e .[eval]
+
+# Build dependencies for the separate FlashAttention installation.
+setuptools>=77
+wheel
+packaging>=24
+ninja>=1.11
+psutil>=5.9
