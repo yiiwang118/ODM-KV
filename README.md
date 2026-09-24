@@ -84,8 +84,8 @@ Set the model and `target_avg_bits` in [configs/odmkv.yaml](configs/odmkv.yaml).
 
 ## 🙏 Acknowledgements
 
-Built on [NVIDIA kvpress](https://github.com/NVIDIA/kvpress) and TurboQuant-MSE with Lloyd–Max codebooks. See [third-party notices](THIRD_PARTY_NOTICES.md).
+Includes adaptations of [NVIDIA kvpress](https://github.com/NVIDIA/kvpress) (Apache-2.0) and uses TurboQuant-MSE with Lloyd–Max codebooks.
 
 ## 📄 License
 
-[MIT](LICENSE). Adapted third-party components retain their original licenses.
+[MIT](LICENSE) for ODM-KV contributions; adapted components retain their original licenses.

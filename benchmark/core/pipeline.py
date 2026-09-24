@@ -1,4 +1,4 @@
-# Adapted from NVIDIA kvpress (Apache-2.0); see THIRD_PARTY_NOTICES.md.
+# Adapted from NVIDIA kvpress (Apache-2.0); see LICENSE.
 from __future__ import annotations
 
 import contextlib

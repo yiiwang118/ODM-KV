@@ -13,7 +13,7 @@ head_dim D, D4 = D // 4 packed bytes):
     4p..4p+3. ``norms`` [T] fp32. ``centroids`` [4] fp32 (shared by all banks
     of this bit-width). Rotations ``pi_k`` / ``pi_v`` [D, D] shared by all banks.
 
-Identities (see tests/test_lut_identity.py, tests/test_banked_attention.py):
+Identities:
     q . k_hat = ||k|| * ( centroids[idx] . (pi_k @ q) )
     sum_i w_i v_hat_i = ( sum_i w_i ||v_i|| centroids[idx_i] ) @ pi_v
 
