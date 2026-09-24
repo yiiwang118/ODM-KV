@@ -13,32 +13,32 @@
 
 **① Output-distortion score.** For an entry $i$, `ODMScorer` estimates future attention $\hat p_i$ and its weighted output $\bar o=\sum_j\hat p_jv_j$:
 
-```math
+$$
 \boxed{
 s_i=\hat p_i^2\left(
-\underbrace{\|v_i\|^2}_{\text{value reconstruction}}
-+\underbrace{\frac{\|k_i\|^2}{d}\|v_i-\bar o\|^2}_{\text{key-induced redistribution}}
+\underbrace{\lVert v_i\rVert^2}_{\text{value reconstruction}}
++\underbrace{\frac{\lVert k_i\rVert^2}{d}\lVert v_i-\bar o\rVert^2}_{\text{key-induced redistribution}}
 \right)
 }
-```
+$$
 
 Here $d$ is the head dimension. The implementation smooths $\hat p_i^2$ to $(\hat p_i+\eta)^2$ with $\eta=0.01$.
 
 **② Joint eviction and quantization.** With a calibrated distortion curve $\tilde\varepsilon(b)$, precision allocation minimizes the additive surrogate:
 
-```math
-\min_{\lbrace b_i\rbrace\in\mathcal{B}^N}\;\sum_i s_i\tilde\varepsilon(b_i)
+$$
+\min_{\lbrace b_i\rbrace\in\mathcal{B}^N}\quad\sum_i s_i\tilde\varepsilon(b_i)
 \qquad\text{s.t.}\qquad
 \frac{1}{N}\sum_i b_i\le\bar b.
-```
+$$
 
 For a bit price $\lambda\ge0$, each entry selects
 
-```math
+$$
 b_i^\star(\lambda)=\arg\min_{b\in\mathcal{B}}
 \left\lbrace\underbrace{s_i\tilde\varepsilon(b)}_{\text{distortion cost}}
 +\underbrace{\lambda b}_{\text{bit cost}}\right\rbrace.
-```
+$$
 
 We use TurboQuant-MSE calibration for retained quantized entries, $\tilde\varepsilon(0)=c_{\mathrm{evict}}=0.5$, and $\tilde\varepsilon(16)=0$. Bisection on $\lambda$ and a discrete repair heuristic approach the target budget.
 
