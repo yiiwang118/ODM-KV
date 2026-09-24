@@ -353,6 +353,15 @@ class TurboQuantAdaptiveKVCacheState:
         seq_offset = self.seq_len
         new_len = int(keys.shape[2])
 
+        # Every bit value must map to a configured level, else the token is
+        # silently dropped below while seq_len still advances (length grows but
+        # the token vanishes). Reject up front instead.
+        unseen = set(torch.unique(bits).tolist()) - set(self.bit_levels)
+        if unseen:
+            raise ValueError(
+                f"append: bit values {sorted(unseen)} are not in configured "
+                f"bit_levels {list(self.bit_levels)} — token would be lost.")
+
         for level in self.bit_levels:
             mask = bits == level
             if not mask.any():

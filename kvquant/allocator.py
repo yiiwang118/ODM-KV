@@ -1,334 +1,10 @@
-"""Score → bit-level mapping."""
+"""Quantizer calibration and joint eviction/precision allocation for ODM-KV."""
 from __future__ import annotations
-
 from typing import Optional
-
 import torch
 
-DEFAULT_BIT_LEVELS: tuple[int, ...] = (0, 1, 2, 4, 8)
-
-
-def scores_to_bits(
-    scores: torch.Tensor,
-    bit_levels: tuple[int, ...] = DEFAULT_BIT_LEVELS,
-) -> torch.Tensor:
-    """Map scores in [0, 1] to bit levels via uniform partitioning.
-
-    Splits [0, 1] into ``len(bit_levels)`` equal intervals and assigns each
-    score to the corresponding bit level (sorted ascending).
-
-    Parameters
-    ----------
-    scores:
-        Arbitrary-shape float tensor with values in [0, 1].
-    bit_levels:
-        Sorted tuple of bit levels to assign, e.g. (0, 1, 2, 4, 8).
-        0 means eviction; 16 means keep fp16 (no quantisation).
-
-    Returns
-    -------
-    torch.Tensor
-        Integer tensor of same shape as ``scores``.
-    """
-    assert len(bit_levels) >= 1
-    bits_t = torch.tensor(sorted(bit_levels), dtype=torch.int32, device=scores.device)
-
-    if len(bit_levels) == 1:
-        return bits_t[0].expand_as(scores).clone()
-
-    # n intervals → n-1 interior split points at 1/n, 2/n, ..., (n-1)/n
-    n = len(bit_levels)
-    thresholds = torch.linspace(0.0, 1.0, n + 1)[1:-1].to(scores.device)
-    bucket = torch.bucketize(scores.float(), thresholds)   # values in [0, n-1]
-    return bits_t[bucket]
-
-
-def ratio_scores_to_bits(
-    scores: torch.Tensor,
-    bit_levels: tuple[int, ...],
-    ratios: tuple[float, ...],
-    sink_mask: Optional[torch.Tensor] = None,
-    sink_bits: int = 16,
-    per_head: bool = True,
-) -> torch.Tensor:
-    """Map scores to bit levels with user-specified proportions.
-
-    Rank-based N-tier allocation: sort non-sink tokens by importance score
-    (ascending), then assign the bottom ``ratios[0]`` fraction to
-    ``bit_levels[0]``, the next ``ratios[1]`` fraction to ``bit_levels[1]``,
-    and so on.  ``bit_levels`` and ``ratios`` must have the same length and
-    ``ratios`` must sum to 1 (tolerance 1e-3, auto-normalised otherwise).
-
-    The implied average bit budget is ``sum(r_i * b_i)``.
-
-    Fully vectorised — runs in O(N log N) on the GPU via a single argsort.
-
-    Parameters
-    ----------
-    scores:
-        Float tensor of shape ``[*shape]``.  Only the **ranking** matters.
-    bit_levels:
-        Candidate bit widths in ascending order, e.g. ``(1, 2, 4, 8, 16)``.
-        0 = eviction; 16 = keep fp16 (no quantisation).
-    ratios:
-        Fraction of non-sink tokens for each level, same length as
-        ``bit_levels``.  Must sum to ~1.0.
-    sink_mask:
-        Bool tensor, same shape as ``scores``.  ``True`` → ``sink_bits``.
-    sink_bits:
-        Bit width for sink tokens (default ``16`` = fp16).
-    """
-    assert len(bit_levels) == len(ratios), (
-        f"bit_levels ({len(bit_levels)}) and ratios ({len(ratios)}) must have the same length"
-    )
-    shape = scores.shape
-    device = scores.device
-
-    # per_head=True: when scores has shape [..., H, T], allocate per (last-dim
-    # group). Matches kvpress ScorerPress.compress which does
-    # scores.topk(n_kept, dim=-1).indices — per-head top-k. Without this,
-    # cross-head sorting unfairly evicts more from heads with flatter
-    # distributions.
-    if per_head and scores.dim() >= 2:
-        out = torch.empty_like(scores, dtype=torch.int32)
-        # Iterate over leading dims (everything except last)
-        scores_view = scores.reshape(-1, shape[-1])
-        out_view = out.reshape(-1, shape[-1])
-        if sink_mask is not None:
-            sm_view = sink_mask.reshape(-1, shape[-1])
-        else:
-            sm_view = None
-        for i in range(scores_view.shape[0]):
-            sub_sm = sm_view[i] if sm_view is not None else None
-            out_view[i] = ratio_scores_to_bits(
-                scores_view[i], bit_levels, ratios, sub_sm, sink_bits,
-                per_head=False,
-            )
-        return out
-
-    flat = scores.flatten()
-    n = flat.shape[0]
-    result = torch.empty(n, dtype=torch.int32, device=device)
-
-    # ── Fix sink tokens ──────────────────────────────────────────────────
-    if sink_mask is not None:
-        flat_sink = sink_mask.flatten().bool()
-        result[flat_sink] = sink_bits
-        non_sink = ~flat_sink
-    else:
-        non_sink = torch.ones(n, dtype=torch.bool, device=device)
-
-    non_sink_idx = non_sink.nonzero(as_tuple=True)[0]
-    n_active = non_sink_idx.shape[0]
-    if n_active == 0:
-        return result.reshape(shape)
-
-    # Normalise ratios
-    ratios_t = torch.tensor(ratios, dtype=torch.float64)
-    ratios_t = ratios_t / ratios_t.sum()
-
-    # Sort ascending by importance
-    order = flat[non_sink_idx].argsort()
-
-    # Assign bit levels by cumulative ratio boundaries
-    bits = torch.empty(n_active, dtype=torch.int32, device=device)
-    levels = sorted(zip(bit_levels, ratios_t.tolist()), key=lambda x: x[0])
-    cursor = 0
-    for i, (b, r) in enumerate(levels):
-        if i == len(levels) - 1:
-            # Last tier gets all remaining to avoid rounding gaps
-            count = n_active - cursor
-        else:
-            count = int(round(r * n_active))
-            count = min(count, n_active - cursor)
-        bits[order[cursor : cursor + count]] = b
-        cursor += count
-
-    result[non_sink_idx] = bits
-    return result.reshape(shape)
-
-
-def budget_scores_to_bits(
-    scores: torch.Tensor,
-    bit_levels: tuple[int, ...],
-    target_avg_bits: float,
-    sink_mask: Optional[torch.Tensor] = None,
-    sink_bits: int = 16,
-    protect_frac: float = 0.1,
-) -> torch.Tensor:
-    """Map scores to bit levels under an average-bit budget.
-
-    Greedy rank-based allocation: sort non-sink tokens by importance score
-    (descending), start everyone at the lowest level, then sweep through
-    level transitions upgrading the highest-score tokens first until the
-    budget is exhausted.
-
-    Fully vectorised — runs in O(K · N) on the GPU (plus one O(N log N)
-    argsort), where K = len(bit_levels).
-
-    Parameters
-    ----------
-    scores:
-        Float tensor of shape ``[*shape]``.  Only the **ranking** matters;
-        monotonic transforms produce identical output.
-    bit_levels:
-        Candidate bit widths, e.g. ``(0, 4, 8)``.
-    target_avg_bits:
-        Desired average bits for **non-sink** tokens.
-    sink_mask:
-        Bool tensor, same shape as ``scores``.  ``True`` → ``sink_bits``.
-    sink_bits:
-        Bit width for sink tokens (default ``16`` = fp16).
-    protect_frac:
-        Fraction of non-sink tokens to protect at the highest level.
-    """
-    levels = sorted(set(bit_levels))
-    shape = scores.shape
-    device = scores.device
-    flat = scores.flatten()
-    n = flat.shape[0]
-    result = torch.empty(n, dtype=torch.int32, device=device)
-
-    # ── Fix sink tokens ──────────────────────────────────────────────────
-    if sink_mask is not None:
-        flat_sink = sink_mask.flatten().bool()
-        result[flat_sink] = sink_bits
-        non_sink = ~flat_sink
-    else:
-        non_sink = torch.ones(n, dtype=torch.bool, device=device)
-
-    non_sink_idx = non_sink.nonzero(as_tuple=True)[0]
-    n_active = non_sink_idx.shape[0]
-    if n_active == 0:
-        return result.reshape(shape)
-
-    adjusted = max(float(levels[0]), min(float(levels[-1]), target_avg_bits))
-
-    # ── Trivial cases ────────────────────────────────────────────────────
-    if len(levels) == 1:
-        result[non_sink_idx] = levels[0]
-        return result.reshape(shape)
-    if adjusted <= float(levels[0]):
-        result[non_sink_idx] = levels[0]
-        return result.reshape(shape)
-    if adjusted >= float(levels[-1]):
-        result[non_sink_idx] = levels[-1]
-        return result.reshape(shape)
-
-    non_sink_scores = flat[non_sink_idx]
-
-    # Sort by score descending — highest-priority tokens first
-    order = non_sink_scores.argsort(descending=True)
-
-    # Start everyone at the lowest level
-    bits = torch.full((n_active,), levels[0], dtype=torch.int32, device=device)
-    remaining = adjusted * n_active - float(levels[0]) * n_active
-
-    # Sweep through level transitions, upgrading highest-score tokens first
-    for i in range(len(levels) - 1):
-        lo, hi = levels[i], levels[i + 1]
-        delta = float(hi - lo)
-        if delta <= 0 or remaining < delta - 1e-9:
-            continue
-        # Tokens currently at level lo, in priority order
-        at_lo = bits[order] == lo
-        n_at_lo = int(at_lo.sum().item())
-        n_upgrade = min(n_at_lo, int(remaining / delta + 1e-9))
-        if n_upgrade <= 0:
-            continue
-        # Select the first n_upgrade among them (highest score)
-        cum = at_lo.cumsum(dim=0)
-        upgrade_mask = at_lo & (cum <= n_upgrade)
-        bits[order[upgrade_mask]] = hi
-        remaining -= n_upgrade * delta
-
-    _ = protect_frac  # kept for API compatibility
-    result[non_sink_idx] = bits
-    return result.reshape(shape)
-
-
-def compute_ratios(
-    target_avg_bits: float,
-    bit_levels: tuple[int, ...],
-    *,
-    evict_frac: float = 0.0,
-    protect_frac: float = 0.0,
-) -> tuple[float, ...]:
-    """Compute ratios for ``ratio_scores_to_bits`` that hit a target average.
-
-    Fixes *evict_frac* at the lowest level and *protect_frac* at the highest,
-    then distributes the remaining fraction between the two interior levels
-    that bracket the effective middle-target to hit the budget exactly.
-
-    Parameters
-    ----------
-    target_avg_bits:
-        Desired average bit-width.
-    bit_levels:
-        Sorted candidate levels, e.g. ``(0, 2, 4, 8)``.
-    evict_frac:
-        Fraction pinned to the lowest level (e.g. 0-bit eviction).
-    protect_frac:
-        Fraction pinned to the highest level (e.g. 8-bit full precision).
-
-    Returns
-    -------
-    tuple[float, ...]
-        Ratios aligned with *bit_levels*, summing to 1.0, with implied
-        average ≈ *target_avg_bits*.
-
-    Examples
-    --------
-    >>> compute_ratios(2.0, (0, 2, 4, 8), evict_frac=0.25, protect_frac=0.05)
-    (0.25, 0.6, 0.1, 0.05)       # avg = 0+1.2+0.4+0.4 = 2.0
-    >>> compute_ratios(3.0, (0, 2, 4, 8), evict_frac=0.10, protect_frac=0.05)
-    (0.1, 0.3571..., 0.4928..., 0.05)   # avg ≈ 3.0
-    """
-    levels = sorted(set(int(b) for b in bit_levels))
-    K = len(levels)
-    if K < 2:
-        return (1.0,)
-
-    lo, hi = float(levels[0]), float(levels[-1])
-    target = max(lo, min(hi, target_avg_bits))
-
-    evict_frac = max(0.0, min(evict_frac, 0.99))
-    protect_frac = max(0.0, min(protect_frac, 0.99))
-    if evict_frac + protect_frac >= 1.0:
-        protect_frac = max(0.0, 0.99 - evict_frac)
-
-    middle_frac = 1.0 - evict_frac - protect_frac
-    ratios = [0.0] * K
-    ratios[0] = evict_frac
-    ratios[-1] = protect_frac
-
-    if middle_frac <= 1e-9:
-        return tuple(ratios)
-
-    # Effective target for the middle portion
-    middle_target = (target - evict_frac * lo - protect_frac * hi) / middle_frac
-    middle_target = max(lo, min(hi, middle_target))
-
-    # Find two levels that bracket middle_target
-    bracket_lo = max(lv for lv in levels if lv <= middle_target)
-    bracket_hi = min(lv for lv in levels if lv >= middle_target)
-
-    if bracket_lo == bracket_hi:
-        # middle_target exactly matches a level
-        ratios[levels.index(bracket_lo)] += middle_frac
-    else:
-        span = float(bracket_hi - bracket_lo)
-        r_hi = middle_frac * (middle_target - bracket_lo) / span
-        r_lo = middle_frac - r_hi
-        ratios[levels.index(bracket_lo)] += r_lo
-        ratios[levels.index(bracket_hi)] += r_hi
-
-    return tuple(ratios)
-
-
-# ---------------------------------------------------------------------------
-# OCS (Outlier Channel Separation) helpers
-# ---------------------------------------------------------------------------
+DEFAULT_BIT_LEVELS = (0, 2, 3, 4, 8, 16)
+_epsilon_cache: dict[tuple, dict[int, float]] = {}
 
 def effective_bits(b: int, n_outlier: int = 0, d: int = 128, outlier_min_bits: int = 4) -> float:
     """Actual average bits per element with OCS.
@@ -340,13 +16,6 @@ def effective_bits(b: int, n_outlier: int = 0, d: int = 128, outlier_min_bits: i
         return float(b)
     b_out = max(b, outlier_min_bits)
     return b + n_outlier * max(0, b_out - b) / d
-
-
-# ---------------------------------------------------------------------------
-# Epsilon calibration
-# ---------------------------------------------------------------------------
-
-_epsilon_cache: dict[tuple, dict[int, float]] = {}
 
 
 @torch.no_grad()
@@ -383,7 +52,7 @@ def calibrate_epsilon(
     """
     device = torch.device(device) if isinstance(device, str) else device
     cache_key = (
-        d, tuple(sorted(bit_levels)), seed, value_group_size,
+        d, tuple(sorted(bit_levels)), n_samples, seed, value_group_size,
         n_outlier, outlier_min_bits, value_quantizer,
     )
     if cache_key in _epsilon_cache:
@@ -452,10 +121,6 @@ def calibrate_epsilon(
     return epsilon
 
 
-# ---------------------------------------------------------------------------
-# Lagrangian-optimal bit allocation
-# ---------------------------------------------------------------------------
-
 def optimal_scores_to_bits(
     scores: torch.Tensor,
     bit_levels: tuple[int, ...],
@@ -463,13 +128,20 @@ def optimal_scores_to_bits(
     epsilon: dict[int, float],
     sink_mask: Optional[torch.Tensor] = None,
     sink_bits: int = 16,
-    eviction_cost: float = 5.0,
+    eviction_cost: float = 0.5,
     n_outlier: int = 0,
     head_dim: int = 128,
     outlier_min_bits: int = 4,
     above_target_alpha: float = 1.0,
-) -> torch.Tensor:
-    """Lagrangian-optimal per-token bit allocation under a budget.
+    fixed_lambda: Optional[float] = None,
+    return_lambda: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, float]:
+    """Lagrangian per-token allocation followed by heuristic budget repair.
+
+    The raw assignment at a fixed λ is optimal for the budget it attains.
+    When binary search does not land on the requested discrete budget, the
+    final score-ordered promotion/demotion pass is a feasibility heuristic;
+    this function does not claim that repaired output is globally optimal.
 
     For each non-sink token *i* with importance score *s_i*, assigns
 
@@ -480,7 +152,7 @@ def optimal_scores_to_bits(
     When ``above_target_alpha < 1``, the ε benefit for levels above the
     target is compressed:
 
-        ε'(b) = ε(target) · (ε(b) / ε(target))^α   for b > target
+        ε'(b) = (1 - α) · ε(target) + α · ε(b)   for b > target
 
     This prevents over-allocation to high bit levels where marginal
     quality improvement is negligible (e.g. 8-bit vs 4-bit).
@@ -499,14 +171,15 @@ def optimal_scores_to_bits(
     sink_mask, sink_bits : optional
         As in ``ratio_scores_to_bits``.
     eviction_cost : float
-        Multiplier on ``ε(0)`` to penalise eviction.  Default 5.0.
+        Multiplier on ``ε(0)`` to price eviction.  Default 0.5.
     n_outlier : int
         Number of outlier channels per head for OCS.  0 = disabled.
     head_dim : int
         Head dimension, used for effective bits calculation.
     above_target_alpha : float
-        Compression exponent for ε above target.  1.0 = no compression
-        (original behaviour).  Lower values reduce the incentive to
+        Linear interpolation weight for ε above target.  1.0 = no compression
+        (original behaviour); 0.0 flattens those levels to ε(target).
+        Lower values reduce the incentive to
         allocate bits above the target.  Recommended: 0.5.
     """
     levels = sorted(set(bit_levels))
@@ -527,13 +200,15 @@ def optimal_scores_to_bits(
     non_sink_idx = non_sink.nonzero(as_tuple=True)[0]
     n_active = non_sink_idx.shape[0]
     if n_active == 0:
-        return result.reshape(shape)
+        bits_out = result.reshape(shape)
+        return (bits_out, 0.0) if return_lambda else bits_out
 
     # ── Trivial cases ────────────────────────────────────────────────
     target = max(float(levels[0]), min(float(levels[-1]), target_avg_bits))
     if len(levels) == 1:
         result[non_sink_idx] = levels[0]
-        return result.reshape(shape)
+        bits_out = result.reshape(shape)
+        return (bits_out, 0.0) if return_lambda else bits_out
 
     s = flat[non_sink_idx]                                         # [n_active]
 
@@ -576,33 +251,52 @@ def optimal_scores_to_bits(
     nominal_t = torch.tensor(levels, dtype=torch.int32, device=device) # [K]
 
     # ── Helper: assign bits at a given λ ─────────────────────────────
-    def _assign(lam: float) -> tuple[torch.Tensor, float]:
+    # lam may be a python float OR a 0-d GPU tensor; both broadcast cleanly.
+    def _assign(lam):
         # cost[k, i] = s_i × ε'(b_k) + λ × eff(b_k)
         cost = s.unsqueeze(0) * eps_t.unsqueeze(1) + lam * bits_t.unsqueeze(1)
         chosen = cost.argmin(dim=0)                                # [n_active]
-        avg = bits_t[chosen].mean().item()
+        avg = bits_t[chosen].mean()                                # 0-d GPU tensor
         return chosen, avg
 
-    # ── Binary search for λ ──────────────────────────────────────────
+    # ── Resolve λ ────────────────────────────────────────────────────
     # Large λ penalises bits → pushes towards 0-bit → low avg.
     # Small λ → pushes towards max-bit → high avg.
-    lo, hi = 0.0, 1.0
+    if fixed_lambda is not None:
+        # Pre-calibrated λ path: skip binary search. Used for streaming
+        # per-layer commit where a global λ* was captured on a prior
+        # prefill. The per-layer budget drift is by design — global
+        # accuracy comes from applying the *same* λ everywhere.
+        lam_star_t = torch.tensor(float(fixed_lambda), dtype=torch.float32, device=device)
+        chosen, avg_t = _assign(lam_star_t)
+        lam_star = float(fixed_lambda)
+    else:
+        # Tensorised binary search: keep lo/hi/mid as 0-d GPU tensors so
+        # the 64-iter loop runs without Python ↔ GPU sync per iteration.
+        # Previous impl called .item() once per iter (~65 syncs per
+        # allocate); now we sync exactly once at the end.
+        #
+        # Start hi at 1e8 instead of widening incrementally — same kernel
+        # count as the old typical case (hi=1.0 sufficient + 64 search +
+        # 1 final = 65 calls). 64 halvings give resolution 1e8/2^64 ≈
+        # 5e-12, more than enough to bracket lam* to ε.
+        lo = torch.zeros((), dtype=torch.float32, device=device)
+        hi = torch.full((), 1e8, dtype=torch.float32, device=device)
+        target_t = torch.tensor(target, dtype=torch.float32, device=device)
 
-    # Widen upper bound until avg is below target
-    _, avg_at_hi = _assign(hi)
-    while avg_at_hi > target and hi < 1e8:
-        hi *= 10.0
-        _, avg_at_hi = _assign(hi)
+        for _ in range(64):
+            mid = (lo + hi) * 0.5
+            _, avg_mid = _assign(mid)
+            over = avg_mid > target_t
+            lo = torch.where(over, mid, lo)
+            hi = torch.where(over, hi, mid)
 
-    for _ in range(64):
-        mid = (lo + hi) * 0.5
-        _, avg = _assign(mid)
-        if avg > target:
-            lo = mid
-        else:
-            hi = mid
+        lam_star_t = (lo + hi) * 0.5
+        chosen, avg_t = _assign(lam_star_t)
+        # Defer lam_star → cpu sync until we know it's needed (return_lambda)
+        lam_star = None
 
-    chosen, avg = _assign((lo + hi) * 0.5)
+    avg = avg_t.item()                                             # 1 sync (for gap math)
 
     # ── Post-processing: close budget gap via greedy adjustment ──────
     # Work with effective bits for budget math; chosen indices map to
@@ -611,7 +305,11 @@ def optimal_scores_to_bits(
     nom_assigned = nominal_t[chosen].float()                       # [n_active] nominal
     gap = (avg - target) * n_active                                # total excess eff bits
 
-    if abs(gap) > 0.5:
+    # Skip gap-closing when a pre-calibrated λ is in use: the point of
+    # fixed_lambda is to mirror the *global* argmin, so we must NOT do
+    # per-call promotion/demotion based on the local score distribution.
+    do_gap_closing = fixed_lambda is None
+    if do_gap_closing and abs(gap) > 0.5:
         order = s.argsort()                                        # ascending
         eff_ordered = eff_assigned[order]
         nom_ordered = nom_assigned[order]
@@ -660,4 +358,9 @@ def optimal_scores_to_bits(
         nom_assigned[order] = nom_ordered
 
     result[non_sink_idx] = nom_assigned.to(torch.int32)
-    return result.reshape(shape)
+    bits_out = result.reshape(shape)
+    if return_lambda:
+        if lam_star is None:
+            lam_star = lam_star_t.item()
+        return bits_out, lam_star
+    return bits_out

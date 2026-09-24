@@ -1,4 +1,4 @@
-# Adapted from autokv/kvpress/pipeline.py
+# Adapted from NVIDIA kvpress (Apache-2.0); see THIRD_PARTY_NOTICES.md.
 from __future__ import annotations
 
 import contextlib
@@ -129,7 +129,7 @@ class KVPressTextGenerationRunner:
             cache = DynamicCache()
 
         # Press context manager wraps the prefill (and decode too if the backend
-        # needs hooks during decode, e.g. TurboQuantPerTokenBackendPress with
+        # needs hooks during decode, e.g. ODMPress with
         # decode_quant=True).
         backbone = self.model.model if hasattr(self.model, "model") else self.model
         needs_decode_hooks = press is not None and getattr(press, "decode_quant", False)

@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""LongBench evaluation for TurboQuant KV quantization.
+"""LongBench evaluation for ODM-KV.
 
 Usage:
-    python eval_longbench.py --config configs/uniform.yaml
-    python eval_longbench.py --config configs/mixed_2.5bit.yaml
-    python eval_longbench.py --config configs/mixed_3.5bit.yaml
+    python eval_longbench.py --config configs/odmkv.yaml
 
 Config file format — see configs/ for examples.
 """
@@ -30,44 +28,13 @@ def _make_press(exp: dict[str, Any], seed: int) -> Optional[BasePress]:
     return _make_press_impl(exp, seed)
 
 
-def _parse_experiments(
-    cfg: dict[str, Any],
-    seed: int,
-) -> list[tuple[str, Optional[BasePress]]]:
-    """Build (label, press) pairs from config.
+def _parse_experiments(cfg: dict[str, Any], seed: int):
+    """Build the explicitly configured ODM-KV / FullKV evaluation runs."""
+    experiments = cfg.get("experiments")
+    if not experiments:
+        raise ValueError("configuration must contain a nonempty experiments list")
+    return [(exp.get("label") or _auto_label(exp), _make_press(exp, seed)) for exp in experiments]
 
-    Supports two formats:
-
-    New format (preferred):
-        experiments:
-          - label: baseline
-            mode: baseline
-          - label: b=4
-            mode: uniform
-            bits: 4
-          - label: 2.5bit
-            mode: mixed
-            b_high: 3
-            b_low: 2
-            n_outlier: 64
-
-    Legacy format (backward compat):
-        bits: [0, 8, 4, 2, 1]   # 0 = baseline
-    """
-    if "experiments" in cfg:
-        result = []
-        for exp in cfg["experiments"]:
-            label = exp.get("label") or _auto_label(exp)
-            result.append((label, _make_press(exp, seed)))
-        return result
-
-    # Legacy: bits list
-    bits_raw = cfg.get("bits", [0, 8, 4, 2, 1])
-    bits = [int(b) for b in bits_raw]
-    return [
-        ("baseline" if b == 0 else f"b={b}", _make_press({"mode": "baseline" if b == 0 else "uniform", "bits": b}, seed))
-        for b in bits
-    ]
 
 
 def _auto_label(exp: dict[str, Any]) -> str:

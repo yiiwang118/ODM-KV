@@ -13,3 +13,7 @@ override.yaml
 override2.yaml
 .envrc
 .venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/

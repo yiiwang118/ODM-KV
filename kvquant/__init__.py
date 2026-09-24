@@ -1,17 +1,14 @@
-from kvquant.allocator import (
-    scores_to_bits, ratio_scores_to_bits, optimal_scores_to_bits,
-    calibrate_epsilon, effective_bits, DEFAULT_BIT_LEVELS,
-)
-from kvquant.adaptive_backend_press import TurboQuantPerTokenBackendPress
-from kvquant.scorer import BaseScorer, ExpectedAttentionScorer, RiskScorer
-from kvquant.backend_press import TurboQuantBackendPress
-from kvquant.press import TurboQuantPerTokenPress
+"""ODM-KV public API. Native CUDA components are imported on demand."""
+from kvquant.scorer import ODMScorer
 
-__all__ = [
-    "scores_to_bits", "ratio_scores_to_bits", "optimal_scores_to_bits",
-    "calibrate_epsilon", "effective_bits", "DEFAULT_BIT_LEVELS",
-    "BaseScorer", "ExpectedAttentionScorer", "RiskScorer",
-    "TurboQuantBackendPress",
-    "TurboQuantPerTokenPress",
-    "TurboQuantPerTokenBackendPress",
-]
+__all__ = ["ODMScorer", "ODMPress", "make_press"]
+
+
+def __getattr__(name):
+    if name == "ODMPress":
+        from kvquant.press import ODMPress
+        return ODMPress
+    if name == "make_press":
+        from kvquant.factory import make_press
+        return make_press
+    raise AttributeError(name)

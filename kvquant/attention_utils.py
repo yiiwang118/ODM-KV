@@ -1,12 +1,6 @@
 """Attention / RoPE / GQA helpers shared by scorers and press implementations.
 
-Previously these lived as private ``_`` helpers inside :mod:`kvquant.scorer`,
-which caused :mod:`kvquant.adaptive_backend_press` to reach into another module's
-private namespace. They are attention-mechanism utilities, not scorer-specific,
-so they belong in their own module.
-
-:mod:`kvquant.scorer` re-exports all of these under the same ``_`` names for
-backwards compatibility, so ``from kvquant.scorer import _repeat_kv`` still works.
+Utilities for ODMScorer and reference/native model integration.
 """
 from __future__ import annotations
 
@@ -46,7 +40,7 @@ def _get_query_states(module: nn.Module, hidden_states: torch.Tensor) -> torch.T
     elif hasattr(module, "q_proj"):
         query_states = module.q_proj(hidden_states)
     else:
-        raise NotImplementedError(f"ExpectedAttentionScorer does not support {module.__class__.__name__}.")
+        raise NotImplementedError(f"ODMScorer does not support {module.__class__.__name__}.")
 
     query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
     if hasattr(module, "q_norm"):
@@ -61,6 +55,7 @@ def _apply_avg_rope(
     q_len: int,
     n_future_positions: int,
     n_samples: int = 8,         # kept for API compat, no longer used
+    rotary_emb: Optional[nn.Module] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Apply averaged RoPE to query mean (and covariance) over future positions.
 
@@ -73,14 +68,13 @@ def _apply_avg_rope(
     components are filtered out (low-pass effect). Low-freq components are
     preserved. This is a designed feature, not a bug.
 
-    History:
-    - commit 3510445: original implementation (matched kvpress, correct)
-    - commit ce8daf3: rewrote to K=8 Monte Carlo + var_mu correction. The
-      rewrite assumed matrix-averaging was wrong (non-orthogonal), but it
-      is intentionally non-orthogonal as a low-pass filter.
-    - commit 2026-04-27: revert to kvpress-aligned matrix averaging.
     """
-    rotary_emb = getattr(module, "rotary_emb", None)
+    # Transformers 5.x moved RoPE from each attention layer to the decoder
+    # root and passes position_embeddings into the layer.  Native callers can
+    # therefore provide the root module explicitly; older simulator callers
+    # continue to resolve the layer-local attribute.
+    if rotary_emb is None:
+        rotary_emb = getattr(module, "rotary_emb", None)
     if rotary_emb is None or n_future_positions <= 0:
         return mu, cov
 
@@ -90,6 +84,16 @@ def _apply_avg_rope(
     cos, sin = _aligned_rotary_outputs(rotary_emb, mu, position_ids)
     cos = cos[0]  # [n_future, d]
     sin = sin[0]  # [n_future, d]
+
+    # For the mean, materialising every [D,D] rotation is unnecessary:
+    # mean_p R(p) mu == mu * mean(cos) + rotate_half(mu) * mean(sin).
+    # exp_joint_mse has covariance disabled, so this removes its former
+    # [n_future,D,D] temporary (32 MiB at future=512,D=128) on every layer.
+    cos_mean = cos.mean(dim=0)
+    sin_mean = sin.mean(dim=0)
+    mu_out = (mu * cos_mean) + (_rotate_half(mu) * sin_mean)
+    if cov is None:
+        return mu_out, None
 
     head_dim = mu.shape[-1]
     half = head_dim // 2
@@ -103,12 +107,6 @@ def _apply_avg_rope(
     # Average element-wise across positions → R_avg [d, d]
     R = cos.unsqueeze(-1) * eye + sin.unsqueeze(-1) * perm   # [n_future, d, d]
     R = R.mean(dim=0)                                          # [d, d]
-
-    # Apply: μ' = R · μ. For [..., d] input, mu @ R.T == R @ mu.T (transpose).
-    mu_out = torch.matmul(mu, R.T)
-
-    if cov is None:
-        return mu_out, None
 
     # Σ' = R · Σ · R.T
     cov_out = torch.matmul(R, torch.matmul(cov, R.T))
@@ -157,55 +155,29 @@ def _apply_rotary_pos_emb_q(
     return (q * cos) + (_rotate_half(q) * sin)
 
 
-def _chunked_attention_qk(
-    query_states: torch.Tensor,   # [1, H_q, T_q, d]
-    expanded_keys_t: torch.Tensor,  # [1, H_q, d, T_kv]
-    T_kv: int,
-    H_kv: int,
-    n_groups: int,
-    scale: float,
-    chunk_size: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute attention statistics per KV position, chunked over queries.
+def _invert_rotary_pos_emb_q(
+    q_rotated: torch.Tensor,  # [B, H, T, d]
+    cos: torch.Tensor,        # [B, T, d] or [T, d]
+    sin: torch.Tensor,        # same
+) -> torch.Tensor:
+    """Recover pre-RoPE Q from the Q tensor already used by attention.
 
-    Returns (sum_attn, max_attn, sum_sq_attn) each of shape [H_kv, T_kv].
-    Divide sum_attn by the per-position query count to get the mean.
-    sum_sq_attn = Σ_t a_{t,i}² is the L2 norm of the attention column,
-    used by EvictionAwareScorer to estimate eviction risk.
+    Reusing attention's post-RoPE Q plus its cos/sin tables is substantially
+    cheaper than replaying q_proj (once per request in the old prefill scorer).
+    ``cos`` and ``sin`` are not necessarily unit-normalized: long-context RoPE
+    variants multiply both by an attention-scaling factor.  Dividing by
+    ``cos^2 + sin^2`` makes this the true inverse for both ordinary and scaled
+    RoPE.
     """
-    T_q = query_states.shape[2]
-    sum_attn = torch.zeros(H_kv, T_kv, device=device, dtype=dtype)
-    max_attn = torch.zeros(H_kv, T_kv, device=device, dtype=dtype)
-    sum_sq_attn = torch.zeros(H_kv, T_kv, device=device, dtype=dtype)
-
-    for start in range(0, T_q, chunk_size):
-        end = min(start + chunk_size, T_q)
-        q_chunk = query_states[:, :, start:end, :]    # [1, H_q, chunk, d]
-
-        attn_logits = torch.matmul(q_chunk, expanded_keys_t) / scale  # [1, H_q, chunk, T_kv]
-
-        # Causal mask
-        q_pos = torch.arange(start, end, device=device)
-        k_pos = torch.arange(T_kv, device=device)
-        causal = q_pos.unsqueeze(1) < k_pos.unsqueeze(0)            # [chunk, T_kv]
-        attn_logits.masked_fill_(causal.unsqueeze(0).unsqueeze(0), float("-inf"))
-
-        attn_w = torch.softmax(attn_logits, dim=-1)                 # [1, H_q, chunk, T_kv]
-
-        # Reduce over GQA groups → [1, H_kv, chunk, T_kv]
-        attn_kv = attn_w.reshape(1, H_kv, n_groups, end - start, T_kv).mean(dim=2)
-
-        chunk_kv = attn_kv.squeeze(0)                                # [H_kv, chunk, T_kv]
-
-        # Accumulate sum over query positions → [H_kv, T_kv]
-        sum_attn += chunk_kv.sum(dim=1)
-
-        # Accumulate max over query positions → [H_kv, T_kv]
-        max_attn = torch.max(max_attn, chunk_kv.amax(dim=1))
-
-        # Accumulate sum of squares → [H_kv, T_kv]
-        sum_sq_attn += chunk_kv.pow(2).sum(dim=1)
-
-    return sum_attn, max_attn, sum_sq_attn
+    if cos.dim() == 2:
+        cos = cos.unsqueeze(0)
+        sin = sin.unsqueeze(0)
+    # Do the inverse in fp32. Q has already been rounded to its attention dtype,
+    # but fp32 arithmetic avoids adding another large bf16 division error for
+    # scaled-RoPE models.
+    work_dtype = torch.float32 if q_rotated.dtype in (torch.float16, torch.bfloat16) else q_rotated.dtype
+    q = q_rotated.to(work_dtype)
+    cos = cos.unsqueeze(1).to(device=q_rotated.device, dtype=work_dtype)
+    sin = sin.unsqueeze(1).to(device=q_rotated.device, dtype=work_dtype)
+    denom = (cos.square() + sin.square()).clamp_min(torch.finfo(work_dtype).tiny)
+    return ((q * cos) - (_rotate_half(q) * sin)) / denom

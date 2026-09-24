@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "odm-kv"
+version = "0.1.0"
+description = "KV cache compression via attention output distortion minimization"
+requires-python = ">=3.10"
+license = "MIT AND Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/*.txt"]
+dependencies = [
+    "torch==2.8.0",
+    "transformers==5.0.0",
+    "numpy>=2.0,<3",
+    "scipy>=1.13,<2",
+    "accelerate>=1.0,<2",
+    "pyyaml>=6,<7",
+]
+
+[project.optional-dependencies]
+eval = ["datasets>=2.21,<3", "pandas>=2.2,<3", "rouge>=1.0,<2", "jieba>=0.42", "fuzzywuzzy>=0.18"]
+test = ["pytest>=8,<9"]
+
+[tool.setuptools]
+py-modules = ["codebook"]
+
+[tool.setuptools.packages.find]
+include = ["kvquant*", "benchmark*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

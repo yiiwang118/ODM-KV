@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="260" viewBox="0 0 1200 260" role="img" aria-labelledby="title desc">
+  <title id="title">ODM-KV overview</title>
+  <desc id="desc">Estimate attention, measure output distortion with ODMScorer, allocate a shared bit budget, and pack the mixed precision KV cache.</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8Z" fill="#64748b"/></marker></defs>
+  <rect x="1" y="1" width="1198" height="258" rx="18" fill="#f8fafc" stroke="#e2e8f0"/>
+  <g font-family="Arial, Helvetica, sans-serif" text-anchor="middle">
+    <text x="600" y="38" font-size="17" fill="#475569">Joint eviction and mixed precision under one KV budget</text>
+    <g fill="#fff" stroke="#cbd5e1" stroke-width="1.5">
+      <rect x="28" y="66" width="250" height="140" rx="12"/>
+      <rect x="326" y="66" width="250" height="140" rx="12" stroke="#6366f1"/>
+      <rect x="624" y="66" width="250" height="140" rx="12" stroke="#6366f1"/>
+      <rect x="922" y="66" width="250" height="140" rx="12"/>
+    </g>
+    <g font-size="21" font-weight="bold" fill="#0f172a">
+      <text x="153" y="103">Estimate attention</text>
+      <text x="451" y="103" fill="#4338ca">ODMScorer</text>
+      <text x="749" y="103" fill="#4338ca">Allocate bits</text>
+      <text x="1047" y="103">Pack &amp; decode</text>
+    </g>
+    <g font-size="16" fill="#475569">
+      <text x="153" y="139">Prefill query statistics</text><text x="153" y="167">Future-position RoPE</text>
+      <text x="451" y="139">Value reconstruction error</text><text x="451" y="167">Key-induced attention shift</text>
+      <text x="749" y="139">Lagrangian budget search</text><text x="749" y="167">0 / 2 / 3 / 4 / 8 / 16</text>
+      <text x="1047" y="139">Mixed-precision KV banks</text><text x="1047" y="167">Protected recent buffer</text>
+    </g>
+    <text x="600" y="237" font-size="14" fill="#64748b">0 bits: evict · 16 bits: full precision · Bit fractions adapt to each input</text>
+  </g>
+  <g stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"><path d="M286 136H316"/><path d="M584 136H614"/><path d="M882 136H912"/></g>
+</svg>

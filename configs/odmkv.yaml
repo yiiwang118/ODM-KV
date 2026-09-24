@@ -1,0 +1,8 @@
+# Minimal ODM-KV quality evaluation. Only the average-bit budget is required.
+model: meta-llama/Meta-Llama-3.1-8B-Instruct
+seed: 42
+fraction: 1.0
+experiments:
+  - label: ODM-KV
+    mode: reference
+    target_avg_bits: 2.0

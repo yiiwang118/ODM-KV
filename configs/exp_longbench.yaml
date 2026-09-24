@@ -28,13 +28,13 @@ seed: 42
 output: results/exp_longbench.json
 
 experiments:
-  - label: baseline
+  - label: FullKV
     mode: baseline
 
-  - label: odmkv_2bit
-    mode: backend_per_token
+  - label: ODM-KV
+    mode: reference
     bits: [0, 2, 3, 4, 8, 16]
     target_avg_bits: 2.0
     eviction_cost: 0.5
     n_outlier_channels: 0
-    outlier_min_bits: 2
+    outlier_min_bits: 3

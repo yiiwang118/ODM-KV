@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RULER evaluation for TurboQuant KV quantization.
+"""RULER evaluation for ODM-KV.
 
 Usage:
     python eval_ruler.py --config configs/exp_ruler.yaml

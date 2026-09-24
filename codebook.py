@@ -6,8 +6,8 @@ After random rotation, each coordinate follows a Beta((d-1)/2, (d-1)/2) distribu
 (Lloyd-Max) problem for this distribution to obtain optimal scalar quantizer centroids.
 """
 
+import math
 import numpy as np
-from scipy import stats, optimize
 from typing import Tuple
 
 
@@ -22,9 +22,14 @@ def beta_pdf_normalized(x: np.ndarray, d: int) -> np.ndarray:
     if d >= 100:
         # Gaussian approximation is accurate for d >= 100
         std = 1.0 / np.sqrt(d)
-        return stats.norm.pdf(x, loc=0, scale=std)
+        z = x / std
+        return np.exp(-0.5 * z * z) / (std * math.sqrt(2.0 * math.pi))
     else:
         # Exact distribution: Beta((d-1)/2, (d-1)/2) mapped to [-1, 1]
+        # SciPy is intentionally lazy: production head_dim=128 follows the
+        # Gaussian branch and low-level kernel startup should not import the
+        # full SciPy stack merely to construct standard codebooks.
+        from scipy import stats
         a = (d - 1) / 2.0
         b = (d - 1) / 2.0
         t = (x + 1) / 2.0  # map [-1, 1] -> [0, 1]
